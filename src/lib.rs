@@ -18,7 +18,7 @@
 //!
 //! type FuncHook = extern "thiscall" fn(&HookStruct);
 //!
-//! const FUNC_HOOK_PTR: Pointer<0x123456, FuncHook> = Pointer::new();
+//! const FUNC_HOOK_PTR: Pointer<0x123456, FuncHook> = Pointer::new_ref();
 //!
 //! #[allow(non_snake_case)]
 //! extern "thiscall" fn DetourHook(this: &HookStruct) {
@@ -49,11 +49,12 @@
 //!
 
 mod detours;
-mod disassembly;
 mod error;
+mod inst;
 #[macro_use]
 pub mod ext;
 mod mem;
+pub use mem::{raw_read, raw_write};
 pub(crate) mod platform;
 
 pub use detours::{Detour, Detours, DetoursGuard};

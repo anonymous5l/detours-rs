@@ -1,13 +1,14 @@
-use crate::platform::windows::{
+use crate::platform::{
     MEM_TYPE_COMMIT, MEM_TYPE_FREE, MEM_TYPE_RESERVE, PAGE_FLAG_EXECUTE_READ,
-    PAGE_FLAG_EXECUTE_READWRITE, flush_instruction_cache, get_current_process, valloc, vfree,
-    vprotect, vquery,
+    PAGE_FLAG_EXECUTE_READWRITE, VirtualProtectGuard, valloc, vfree, vprotect, vquery,
 };
-use crate::{Error, disassembly, platform};
+#[cfg(target_os = "windows")]
+use crate::platform::{flush_instruction_cache, get_current_process};
+use crate::{Error, inst, platform};
 use std::ffi::c_void;
-use std::mem;
 use std::ops::{Range, RangeInclusive};
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::{mem, ptr};
 
 pub(crate) const DETOUR_REGION_SIZE: usize = 0x10000;
 
@@ -46,7 +47,7 @@ fn detour_alloc_region_from_hi(range: Range<usize>) -> Option<usize> {
                 MEM_TYPE_COMMIT | MEM_TYPE_RESERVE,
             ) {
                 #[cfg(target_os = "windows")]
-                if super::platform::windows::check_dynamic_code_blocked() {
+                if platform::check_dynamic_code_blocked() {
                     return None;
                 }
                 return Some(pv as _);
@@ -80,7 +81,7 @@ fn detour_alloc_region_from_lo(range: Range<usize>) -> Option<usize> {
                 MEM_TYPE_COMMIT | MEM_TYPE_RESERVE,
             ) {
                 #[cfg(target_os = "windows")]
-                if super::platform::windows::check_dynamic_code_blocked() {
+                if platform::check_dynamic_code_blocked() {
                     return None;
                 }
                 return Some(pv as _);
@@ -224,6 +225,7 @@ impl<const N: usize> Regions<N> {
     }
 
     pub fn lock(&self) -> Result<(), Error> {
+        #[cfg(target_os = "windows")]
         let process = get_current_process();
         for x in self.regions.iter() {
             vprotect(
@@ -231,6 +233,7 @@ impl<const N: usize> Regions<N> {
                 x.range.end - x.range.start,
                 PAGE_FLAG_EXECUTE_READ,
             )?;
+            #[cfg(target_os = "windows")]
             flush_instruction_cache(
                 process,
                 x.range.start as *const c_void,
@@ -255,7 +258,7 @@ impl<const N: usize> Regions<N> {
     }
 
     pub fn alloc_block<T>(&mut self, expect: *const c_void) -> Option<Block<T>> {
-        let inst = disassembly::decoder(expect).decode();
+        let inst = inst::decoder(expect).decode();
         let bound = platform::detour_find_jmp_bounds(&inst);
 
         self.current
@@ -289,4 +292,14 @@ impl<const N: usize> Regions<N> {
             false
         }
     }
+}
+
+pub fn raw_write<T: Sized>(ptr: usize, data: T) {
+    let _guard =
+        VirtualProtectGuard::guard(ptr as *const T, size_of::<T>(), PAGE_FLAG_EXECUTE_READWRITE);
+    unsafe { ptr::write(ptr as *mut T, data) }
+}
+
+pub fn raw_read<T: Sized>(ptr: usize) -> T {
+    unsafe { ptr::read::<T>(ptr as *const T) }
 }

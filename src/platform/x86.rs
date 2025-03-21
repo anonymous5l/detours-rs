@@ -1,4 +1,4 @@
-use crate::disassembly;
+use crate::inst;
 use iced_x86::Code::Jmp_rel32_32;
 use iced_x86::{Code, Instruction};
 use std::ops::{Range, RangeInclusive};
@@ -12,6 +12,9 @@ use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery}
 use windows_sys::Win32::System::SystemServices::{
     IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE,
 };
+
+const X86_JMP_SIZE: usize = 5;
+pub const NEEDED_BYTES: usize = X86_JMP_SIZE;
 
 #[inline]
 pub fn detour_2gb_below(addr: usize) -> usize {
@@ -92,7 +95,7 @@ pub fn detour_skip_jmp(mut inst: Instruction) -> usize {
             target as *const core::ffi::c_void,
         ) {
             // maybe out of mem bounds
-            inst = unsafe { disassembly::decode_instruction::<2>(target) };
+            inst = unsafe { inst::decode_instruction::<2>(target) };
             code = target;
         }
     }
@@ -101,7 +104,7 @@ pub fn detour_skip_jmp(mut inst: Instruction) -> usize {
         code = inst.memory_displacement32() as usize;
         let code_original = code;
 
-        let inst = unsafe { disassembly::decode_instruction::<6>(code) };
+        let inst = unsafe { inst::decode_instruction::<6>(code) };
         if inst.code() == Code::Jmp_rm32 {
             let target = inst.memory_displacement32() as usize;
             if detour_is_imported(
@@ -113,7 +116,7 @@ pub fn detour_skip_jmp(mut inst: Instruction) -> usize {
             }
         } else if inst.code() == Jmp_rel32_32 {
             code = inst.memory_displacement32() as usize;
-            let inst = unsafe { disassembly::decode_instruction::<6>(code) };
+            let inst = unsafe { inst::decode_instruction::<6>(code) };
             if inst.code() == Code::Jmp_rm32 {
                 if inst.memory_displacement32() as usize == code.saturating_add(0x1000) {
                     code = code_original;
@@ -139,4 +142,16 @@ pub fn detour_find_jmp_bounds(inst: &Instruction) -> RangeInclusive<usize> {
         }
     }
     lo..=hi
+}
+
+#[inline]
+pub fn detour_gen_jmp_immediate(pb_code: *mut u8, pb_jmp_val: *mut u8) {
+    let pb_jmp_src = pb_code.wrapping_byte_add(X86_JMP_SIZE);
+    unsafe {
+        *pb_code = 0xe9;
+        ptr::write(
+            pb_code.wrapping_byte_add(1).cast::<i32>(),
+            (pb_jmp_val as i32) - pb_jmp_src as i32,
+        );
+    }
 }

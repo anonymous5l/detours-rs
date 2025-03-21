@@ -5,8 +5,9 @@ const BITNESS: u32 = 32;
 #[cfg(target_pointer_width = "64")]
 const BITNESS: u32 = 64;
 
+#[allow(dead_code)]
 mod __private {
-    use crate::disassembly::BITNESS;
+    use crate::inst::BITNESS;
     use iced_x86::{Decoder, DecoderOptions, Instruction};
     use std::ptr::slice_from_raw_parts;
 

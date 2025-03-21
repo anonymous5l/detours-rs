@@ -1,28 +1,12 @@
 use crate::ext::Pointer;
 use crate::mem::{Block, DETOUR_REGION_SIZE, Regions};
-use crate::platform::detour_skip_jmp;
-use crate::platform::windows::{PAGE_FLAG_EXECUTE_READWRITE, VirtualProtectGuard};
-use crate::{Error, disassembly};
+use crate::platform::{NEEDED_BYTES, PAGE_FLAG_EXECUTE_READWRITE, detour_gen_jmp_immediate};
+use crate::platform::{VirtualProtectGuard, detour_skip_jmp};
+use crate::{Error, inst};
 use fnv::FnvHashMap;
 use std::ffi::c_void;
 use std::ops::Deref;
 use std::ptr;
-
-pub fn detour_code_from_pointer<T>(ptr: *const T) -> *const T {
-    detour_skip_jmp(disassembly::decoder(ptr).decode()) as *const T
-}
-
-#[inline]
-pub fn detour_gen_jmp_immediate(pb_code: *mut u8, pb_jmp_val: *mut u8) {
-    let pb_jmp_src = pb_code.wrapping_byte_add(JMP_SIZE);
-    unsafe {
-        *pb_code = 0xe9;
-        ptr::write(
-            pb_code.wrapping_byte_add(1).cast::<i32>(),
-            (pb_jmp_val as i32) - pb_jmp_src as i32,
-        );
-    }
-}
 
 pub struct Detours {
     regions: Regions<BLOCK_COUNT>,
@@ -37,12 +21,12 @@ impl Detours {
         }
     }
 
-    pub fn lock(&mut self) -> Result<DetoursGuard<'_>, Error> {
-        DetoursGuard::new(self)
-    }
-
     pub fn get(&self, address: &usize) -> Option<&Detour> {
         self.detours.get(&address)
+    }
+
+    pub fn lock(&mut self) -> Result<DetoursGuard<'_>, Error> {
+        DetoursGuard::new(self)
     }
 }
 
@@ -56,8 +40,6 @@ impl Drop for Detours {
 }
 
 const PREFETCH_INST_SIZE: usize = 0x20;
-
-const JMP_SIZE: usize = 5;
 
 const BLOCK_COUNT: usize = DETOUR_REGION_SIZE / size_of::<Trampoline>();
 
@@ -78,10 +60,11 @@ impl Detour {
     ) -> Result<Detour, Error> {
         let mut fetch: usize = 0;
 
-        let mut decoder = disassembly::decoder_with_size(target, PREFETCH_INST_SIZE);
+        let mut decoder = inst::decoder_with_size(target, PREFETCH_INST_SIZE);
         for inst in decoder.iter() {
+            // FIXME depends arch find ret, jmp branch before accumulate then check NEEDED_BYTES is requirement
             fetch += inst.len();
-            if fetch >= JMP_SIZE {
+            if fetch >= NEEDED_BYTES {
                 break;
             }
         }
@@ -147,7 +130,7 @@ impl DetoursGuard<'_> {
         target: Pointer<ADDR, T>,
         detour: *const c_void,
     ) -> Result<(), Error> {
-        self.attach(unsafe { std::mem::transmute(target.deref()) }, detour)
+        self.attach(unsafe { std::mem::transmute(target.raw_addr()) }, detour)
     }
 
     pub fn attach(&mut self, target: *const c_void, detour: *const c_void) -> Result<(), Error> {
@@ -155,8 +138,8 @@ impl DetoursGuard<'_> {
             return Err(Error::InvalidAddress);
         }
 
-        let target = detour_code_from_pointer(target);
-        let detour = detour_code_from_pointer(detour);
+        let target = detour_skip_jmp(inst::decoder(target).decode()) as *const c_void;
+        let detour = detour_skip_jmp(inst::decoder(detour).decode()) as *const c_void;
 
         if target.addr() == detour.addr() {
             return Err(Error::InvalidAddress);

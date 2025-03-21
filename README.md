@@ -8,6 +8,8 @@ code translate from [Microsoft/Detours](https://github.com/microsoft/Detours)
 
 ## Example
 
+Hook address
+
 ```rust
 use detours_rs::ext::Pointer;
 use detours_rs::{Detours, transmute_void};
@@ -23,7 +25,7 @@ struct HookStruct;
 
 type FuncHook = extern "thiscall" fn(&HookStruct);
 
-const FUNC_HOOK_PTR: Pointer<0x123456, FuncHook> = Pointer::new();
+const FUNC_HOOK_PTR: Pointer<0x123456, FuncHook> = Pointer::new_ref();
 
 #[allow(non_snake_case)]
 extern "thiscall" fn DetourHook(this: &HookStruct) {

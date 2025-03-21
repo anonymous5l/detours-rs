@@ -1,6 +1,5 @@
-use crate::platform::windows::{PAGE_FLAG_EXECUTE_READWRITE, VirtualProtectGuard};
+use crate::mem::{raw_read, raw_write};
 use std::ops::{Deref, DerefMut};
-use std::ptr;
 
 #[macro_export]
 macro_rules! transmute_void {
@@ -12,57 +11,6 @@ macro_rules! transmute_void {
     };
 }
 
-// ptr -> ptr -> T
-#[derive(Clone)]
-pub struct FunctionPointer<const ADDR: usize, T: 'static>(&'static *const T);
-
-impl<const ADDR: usize, T: 'static> FunctionPointer<ADDR, T> {
-    pub const fn new() -> FunctionPointer<ADDR, T> {
-        FunctionPointer(unsafe { std::mem::transmute(&ADDR) })
-    }
-
-    pub const fn addr(&self) -> usize {
-        ADDR
-    }
-}
-impl<const ADDR: usize, T> Deref for FunctionPointer<ADDR, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { std::mem::transmute(self.0) }
-    }
-}
-
-// ptr -> ptr -> ptr -> T
-#[repr(transparent)]
-#[derive(Clone)]
-pub struct DoublePointer<const ADDR: usize, T: 'static>(&'static *const *mut T);
-
-impl<const ADDR: usize, T: 'static> DoublePointer<ADDR, T> {
-    pub const fn new() -> DoublePointer<ADDR, T> {
-        DoublePointer(unsafe { std::mem::transmute(&ADDR) })
-    }
-
-    pub const fn addr(&self) -> usize {
-        ADDR
-    }
-}
-
-impl<const ADDR: usize, T> Deref for DoublePointer<ADDR, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { std::mem::transmute(**self.0) }
-    }
-}
-
-impl<const ADDR: usize, T> DerefMut for DoublePointer<ADDR, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { std::mem::transmute(**self.0) }
-    }
-}
-
-// ptr -> T
 #[repr(transparent)]
 #[derive(Clone)]
 pub struct Pointer<const ADDR: usize, T: 'static>(&'static *mut T);
@@ -72,8 +20,35 @@ impl<const ADDR: usize, T: 'static> Pointer<ADDR, T> {
         Pointer(unsafe { std::mem::transmute(&ADDR) })
     }
 
-    pub const fn addr(&self) -> usize {
+    /// make 'static lifetime ref pointer address
+    ///
+    /// equals (void**)
+    ///
+    /// usually use for function pointer
+    ///
+    pub const fn new_ref() -> Pointer<ADDR, T> {
+        Pointer(unsafe { std::mem::transmute(&&ADDR) })
+    }
+
+    pub const fn raw_addr(&self) -> usize {
         ADDR
+    }
+
+    /// DO NOT USE THIS FUNCTION IN SELF MEMORY SPACE
+    pub fn raw_write(&self, val: T) {
+        self.raw_write_for(val)
+    }
+
+    pub fn raw_write_for<F: Sized>(&self, val: F) {
+        raw_write(unsafe { *self.0.cast() }, val)
+    }
+
+    pub fn raw_read(&self) -> T {
+        self.raw_read_for()
+    }
+
+    pub fn raw_read_for<F>(&self) -> F {
+        raw_read(unsafe { *self.0.cast() })
     }
 }
 
@@ -89,14 +64,4 @@ impl<const ADDR: usize, T> DerefMut for Pointer<ADDR, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { std::mem::transmute(*self.0) }
     }
-}
-
-pub fn write<T: Sized>(ptr: usize, data: T) {
-    let _guard =
-        VirtualProtectGuard::guard(ptr as *const T, size_of::<T>(), PAGE_FLAG_EXECUTE_READWRITE);
-    unsafe { ptr::write(ptr as *mut T, data) }
-}
-
-pub fn read<T: Sized>(ptr: usize) -> T {
-    unsafe { ptr::read::<T>(ptr as *const T) }
 }
