@@ -87,9 +87,5 @@ pub fn flush_instruction_cache(
 }
 
 pub fn check_dynamic_code_blocked() -> bool {
-    if (unsafe { GetLastError() }) == ERROR_DYNAMIC_CODE_BLOCKED {
-        true
-    } else {
-        false
-    }
+    (unsafe { GetLastError() }) == ERROR_DYNAMIC_CODE_BLOCKED
 }

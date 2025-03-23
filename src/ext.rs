@@ -1,5 +1,6 @@
 use crate::mem::{raw_read, raw_write};
 use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
 
 #[macro_export]
 macro_rules! transmute_void {
@@ -13,11 +14,17 @@ macro_rules! transmute_void {
 
 #[repr(transparent)]
 #[derive(Clone)]
-pub struct Pointer<const ADDR: usize, T: 'static>(&'static *mut T);
+pub struct Pointer<const ADDR: usize, T: 'static>(&'static NonNull<T>);
+
+impl<const ADDR: usize, T: 'static> Default for Pointer<ADDR, T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl<const ADDR: usize, T: 'static> Pointer<ADDR, T> {
     pub const fn new() -> Pointer<ADDR, T> {
-        Pointer(unsafe { std::mem::transmute(&ADDR) })
+        Pointer(unsafe { std::mem::transmute::<&usize, &NonNull<T>>(&ADDR) })
     }
 
     /// make 'static lifetime ref pointer address
@@ -27,7 +34,7 @@ impl<const ADDR: usize, T: 'static> Pointer<ADDR, T> {
     /// usually use for function pointer
     ///
     pub const fn new_ref() -> Pointer<ADDR, T> {
-        Pointer(unsafe { std::mem::transmute(&&ADDR) })
+        Pointer(unsafe { std::mem::transmute::<&&usize, &NonNull<T>>(&&ADDR) })
     }
 
     pub const fn raw_addr(&self) -> usize {
@@ -35,12 +42,12 @@ impl<const ADDR: usize, T: 'static> Pointer<ADDR, T> {
     }
 
     /// DO NOT USE THIS FUNCTION IN SELF MEMORY SPACE
-    pub fn raw_write(&self, val: T) {
+    pub fn raw_write(&self, val: T) -> usize {
         self.raw_write_for(val)
     }
 
-    pub fn raw_write_for<F: Sized>(&self, val: F) {
-        raw_write(unsafe { *self.0.cast() }, val)
+    pub fn raw_write_for<F: Sized>(&self, val: F) -> usize {
+        raw_write(unsafe { *self.0.as_ptr().cast() }, val)
     }
 
     pub fn raw_read(&self) -> T {
@@ -48,7 +55,7 @@ impl<const ADDR: usize, T: 'static> Pointer<ADDR, T> {
     }
 
     pub fn raw_read_for<F>(&self) -> F {
-        raw_read(unsafe { *self.0.cast() })
+        raw_read(unsafe { *self.0.as_ptr().cast() })
     }
 }
 

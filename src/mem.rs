@@ -1,14 +1,14 @@
 use crate::platform::{
-    MEM_TYPE_COMMIT, MEM_TYPE_FREE, MEM_TYPE_RESERVE, PAGE_FLAG_EXECUTE_READ,
-    PAGE_FLAG_EXECUTE_READWRITE, VirtualProtectGuard, valloc, vfree, vprotect, vquery,
+    MEM_TYPE_COMMIT, MEM_TYPE_FREE, MEM_TYPE_RESERVE, MemoryProtector, PAGE_FLAG_EXECUTE_READ,
+    PAGE_FLAG_EXECUTE_READWRITE, valloc, vfree, vprotect, vquery,
 };
 #[cfg(target_os = "windows")]
 use crate::platform::{flush_instruction_cache, get_current_process};
 use crate::{Error, inst, platform};
 use std::ffi::c_void;
 use std::ops::{Range, RangeInclusive};
+use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::{mem, ptr};
 
 pub(crate) const DETOUR_REGION_SIZE: usize = 0x10000;
 
@@ -32,7 +32,7 @@ fn detour_alloc_region_from_hi(range: Range<usize>) -> Option<usize> {
     let mut pb_try = detour_alloc_round_down_to_region(range.end - DETOUR_REGION_SIZE);
     while pb_try > range.start {
         if SYSTEM_REGION_BOUND.contains(&pb_try) {
-            pb_try = pb_try - 0x08000000;
+            pb_try -= 0x08000000;
             continue;
         }
 
@@ -52,7 +52,7 @@ fn detour_alloc_region_from_hi(range: Range<usize>) -> Option<usize> {
                 }
                 return Some(pv as _);
             }
-            pb_try = pb_try - DETOUR_REGION_SIZE;
+            pb_try -= DETOUR_REGION_SIZE;
         } else {
             pb_try = detour_alloc_round_down_to_region(
                 mbi.allocation_base.wrapping_byte_sub(DETOUR_REGION_SIZE) as usize,
@@ -66,7 +66,7 @@ fn detour_alloc_region_from_lo(range: Range<usize>) -> Option<usize> {
     let mut pb_try = detour_alloc_round_up_to_region(range.start);
     while pb_try < range.end {
         if SYSTEM_REGION_BOUND.contains(&pb_try) {
-            pb_try = pb_try + 0x08000000;
+            pb_try += 0x08000000;
             continue;
         }
 
@@ -86,7 +86,7 @@ fn detour_alloc_region_from_lo(range: Range<usize>) -> Option<usize> {
                 }
                 return Some(pv as _);
             }
-            pb_try = pb_try + DETOUR_REGION_SIZE;
+            pb_try += DETOUR_REGION_SIZE;
         } else {
             pb_try = detour_alloc_round_up_to_region(
                 mbi.base_address.wrapping_byte_add(mbi.region_size) as usize,
@@ -151,6 +151,12 @@ impl<T> AsRef<T> for Block<T> {
     }
 }
 
+impl<T> AsMut<T> for Block<T> {
+    fn as_mut(&mut self) -> &mut T {
+        unsafe { self.0.load(Ordering::Relaxed).as_mut().unwrap() }
+    }
+}
+
 pub struct RegionData<const N: usize> {
     free: Option<usize>,
     range: Range<usize>,
@@ -173,9 +179,9 @@ impl<const N: usize> RegionData<N> {
 
     fn next_free_block<T>(&mut self) -> Option<Block<T>> {
         let block = self.free.take().or(self.find_free_index()).map(|index| {
-            let block = Block(AtomicPtr::new(unsafe {
-                mem::transmute::<_, *mut T>(self.range.start + index * size_of::<T>())
-            }));
+            let block = Block(AtomicPtr::new(
+                (self.range.start + index * size_of::<T>()) as *mut T,
+            ));
             self.state[index] = true;
             block
         })?;
@@ -195,7 +201,7 @@ impl<const N: usize> RegionData<N> {
 
 impl<const N: usize> Drop for RegionData<N> {
     fn drop(&mut self) {
-        let _ = vfree(unsafe { mem::transmute(self.range.start) });
+        let _ = vfree(self.range.start as *mut c_void);
     }
 }
 
@@ -294,10 +300,12 @@ impl<const N: usize> Regions<N> {
     }
 }
 
-pub fn raw_write<T: Sized>(ptr: usize, data: T) {
-    let _guard =
-        VirtualProtectGuard::guard(ptr as *const T, size_of::<T>(), PAGE_FLAG_EXECUTE_READWRITE);
-    unsafe { ptr::write(ptr as *mut T, data) }
+pub fn raw_write<T: Sized>(addr: usize, data: T) -> usize {
+    if let Ok(mut guard) = MemoryProtector::new_with::<T>(addr) {
+        guard.write_override(data)
+    } else {
+        0
+    }
 }
 
 pub fn raw_read<T: Sized>(ptr: usize) -> T {

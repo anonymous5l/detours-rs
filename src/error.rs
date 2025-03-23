@@ -5,8 +5,6 @@ pub enum Error {
     InvalidSignature(usize, usize),
     ErrorCode(usize),
     NotEnoughMemory,
-    EncodeInstruction,
-    LockPoison,
 }
 
 impl Debug for Error {
@@ -29,12 +27,6 @@ impl Display for Error {
             }
             Error::NotEnoughMemory => {
                 write!(f, "not enough memory")
-            }
-            Error::EncodeInstruction => {
-                write!(f, "encode instruction failed")
-            }
-            Error::LockPoison => {
-                write!(f, "lock poison")
             }
         }
     }

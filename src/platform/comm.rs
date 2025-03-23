@@ -1,6 +1,7 @@
 use crate::Error;
-use crate::platform::vprotect;
+use crate::platform::{PAGE_FLAG_EXECUTE_READWRITE, vprotect};
 use std::ffi::c_void;
+use std::ptr;
 
 pub type MemoryAllocType = u32;
 pub type PageProtectionFlag = u32;
@@ -12,29 +13,46 @@ pub struct MemoryBasicInfo {
     pub state: MemoryAllocType,
 }
 
-pub struct VirtualProtectGuard<T> {
-    addr: *const T,
+pub struct MemoryProtector {
+    addr: usize,
     size: usize,
-    restore: PageProtectionFlag,
+    old_flag: PageProtectionFlag,
 }
 
-impl<T> VirtualProtectGuard<T> {
-    pub fn guard(
-        addr: *const T,
-        size: usize,
-        flag: PageProtectionFlag,
-    ) -> Result<VirtualProtectGuard<T>, Error> {
-        let restore = vprotect(addr, size, flag)?;
-        Ok(VirtualProtectGuard {
-            addr,
-            size,
-            restore,
+impl MemoryProtector {
+    pub fn new(addr: usize, size: usize) -> Result<MemoryProtector, Error> {
+        vprotect(addr as *const c_void, size, PAGE_FLAG_EXECUTE_READWRITE).map(|old_flag| {
+            MemoryProtector {
+                addr,
+                size,
+                old_flag,
+            }
         })
+    }
+
+    pub fn new_with<T: Sized>(addr: usize) -> Result<MemoryProtector, Error> {
+        Self::new(addr, size_of::<T>())
+    }
+
+    pub fn write_override<T>(&mut self, value: T) -> usize {
+        let t_size = size_of_val(&value);
+        if t_size > self.size {
+            return 0;
+        }
+        unsafe {
+            ptr::write(self.addr as *mut T, value);
+        }
+        t_size
+    }
+
+    pub unsafe fn write_from_with_size<T>(&mut self, from: *const T, size: usize) -> usize {
+        unsafe { ptr::copy(from, self.addr as *mut T, size) };
+        size
     }
 }
 
-impl<T> Drop for VirtualProtectGuard<T> {
+impl Drop for MemoryProtector {
     fn drop(&mut self) {
-        let _ = vprotect(self.addr, self.size, self.restore);
+        let _ = vprotect(self.addr as *const c_void, self.size, self.old_flag);
     }
 }

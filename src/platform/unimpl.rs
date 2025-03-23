@@ -48,3 +48,7 @@ pub fn detour_find_jmp_bounds(_inst: &Instruction) -> RangeInclusive<usize> {
 pub fn detour_skip_jmp(_inst: Instruction) -> usize {
     unimplemented!()
 }
+
+pub fn detour_does_code_end_function(_inst: &Instruction) -> bool {
+    unimplemented!()
+}

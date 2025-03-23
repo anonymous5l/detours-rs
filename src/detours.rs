@@ -1,16 +1,21 @@
 use crate::ext::Pointer;
 use crate::mem::{Block, DETOUR_REGION_SIZE, Regions};
-use crate::platform::{NEEDED_BYTES, PAGE_FLAG_EXECUTE_READWRITE, detour_gen_jmp_immediate};
-use crate::platform::{VirtualProtectGuard, detour_skip_jmp};
+use crate::platform::{MemoryProtector, detour_skip_jmp};
+use crate::platform::{NEEDED_BYTES, detour_does_code_end_function, detour_gen_jmp_immediate};
 use crate::{Error, inst};
 use fnv::FnvHashMap;
 use std::ffi::c_void;
-use std::ops::Deref;
 use std::ptr;
 
 pub struct Detours {
     regions: Regions<BLOCK_COUNT>,
     detours: FnvHashMap<usize, Detour>,
+}
+
+impl Default for Detours {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Detours {
@@ -22,7 +27,7 @@ impl Detours {
     }
 
     pub fn get(&self, address: &usize) -> Option<&Detour> {
-        self.detours.get(&address)
+        self.detours.get(address)
     }
 
     pub fn lock(&mut self) -> Result<DetoursGuard<'_>, Error> {
@@ -56,20 +61,26 @@ impl Detour {
     pub(crate) fn patch(
         target: *const c_void,
         detour: *const c_void,
-        block: Block<Trampoline>,
+        mut block: Block<Trampoline>,
     ) -> Result<Detour, Error> {
         let mut fetch: usize = 0;
 
         let mut decoder = inst::decoder_with_size(target, PREFETCH_INST_SIZE);
         for inst in decoder.iter() {
-            // FIXME depends arch find ret, jmp branch before accumulate then check NEEDED_BYTES is requirement
             fetch += inst.len();
             if fetch >= NEEDED_BYTES {
                 break;
             }
+            if detour_does_code_end_function(&inst) {
+                break;
+            }
         }
 
-        let rb_code = (block.as_ref() as *const Trampoline).cast_mut();
+        if fetch < NEEDED_BYTES {
+            return Err(Error::InvalidAddress);
+        }
+
+        let rb_code = block.as_mut() as *mut Trampoline;
 
         unsafe {
             ptr::copy(target.cast::<u8>(), rb_code.cast(), fetch);
@@ -79,7 +90,7 @@ impl Detour {
 
         detour_gen_jmp_immediate(rb_code.cast(), target.wrapping_byte_add(fetch) as *mut _);
 
-        let _guard_origin = VirtualProtectGuard::guard(target, fetch, PAGE_FLAG_EXECUTE_READWRITE)?;
+        let _guard_origin = MemoryProtector::new(target.addr(), fetch)?;
 
         detour_gen_jmp_immediate(target as *mut _, detour as *mut _);
 
@@ -106,21 +117,13 @@ impl DetoursGuard<'_> {
     }
 
     pub(crate) fn internal_detach(regions: &mut Regions<BLOCK_COUNT>, detour: &mut Detour) {
-        let target = unsafe { std::mem::transmute::<_, &mut ()>(detour.target) };
-
-        let Ok(_guard_origin) =
-            VirtualProtectGuard::guard(target, detour.fetch, PAGE_FLAG_EXECUTE_READWRITE)
-        else {
+        let Ok(mut mem) = MemoryProtector::new(detour.target, detour.fetch) else {
             return;
         };
 
         unsafe {
-            ptr::copy(
-                (detour.block.as_ref() as *const Trampoline).cast_mut(),
-                (target as *mut ()).cast(),
-                detour.fetch,
-            );
-        }
+            mem.write_from_with_size(detour.block.as_ref() as *const Trampoline, detour.fetch)
+        };
 
         regions.free_block(&mut detour.block);
     }
@@ -130,7 +133,7 @@ impl DetoursGuard<'_> {
         target: Pointer<ADDR, T>,
         detour: *const c_void,
     ) -> Result<(), Error> {
-        self.attach(unsafe { std::mem::transmute(target.raw_addr()) }, detour)
+        self.attach(target.raw_addr() as *const c_void, detour)
     }
 
     pub fn attach(&mut self, target: *const c_void, detour: *const c_void) -> Result<(), Error> {
@@ -159,13 +162,13 @@ impl DetoursGuard<'_> {
     }
 
     pub fn detach(&mut self, address: &usize) {
-        if let Some(mut detour) = self.detours.detours.remove(&address) {
+        if let Some(mut detour) = self.detours.detours.remove(address) {
             DetoursGuard::internal_detach(&mut self.detours.regions, &mut detour);
         }
     }
 
     pub(crate) fn detach_all(&mut self) {
-        std::mem::replace(&mut self.detours.detours, FnvHashMap::default())
+        std::mem::take(&mut self.detours.detours)
             .into_values()
             .for_each(|mut x| DetoursGuard::internal_detach(&mut self.detours.regions, &mut x));
     }

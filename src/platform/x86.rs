@@ -1,5 +1,4 @@
 use crate::inst;
-use iced_x86::Code::Jmp_rel32_32;
 use iced_x86::{Code, Instruction};
 use std::ops::{Range, RangeInclusive};
 use std::ptr;
@@ -114,13 +113,13 @@ pub fn detour_skip_jmp(mut inst: Instruction) -> usize {
                 // maybe out of mem bounds
                 code = target;
             }
-        } else if inst.code() == Jmp_rel32_32 {
+        } else if inst.code() == Code::Jmp_rel32_32 {
             code = inst.memory_displacement32() as usize;
             let inst = unsafe { inst::decode_instruction::<6>(code) };
-            if inst.code() == Code::Jmp_rm32 {
-                if inst.memory_displacement32() as usize == code.saturating_add(0x1000) {
-                    code = code_original;
-                }
+            if inst.code() == Code::Jmp_rm32
+                && inst.memory_displacement32() as usize == code.saturating_add(0x1000)
+            {
+                code = code_original;
             }
         }
     }
@@ -133,7 +132,7 @@ pub fn detour_find_jmp_bounds(inst: &Instruction) -> RangeInclusive<usize> {
     let code = inst.ip() as usize;
     let mut lo = detour_2gb_below(code);
     let mut hi = detour_2gb_above(code);
-    if inst.code() == Jmp_rel32_32 {
+    if inst.code() == Code::Jmp_rel32_32 {
         let new = inst.memory_displacement32() as usize;
         if new < code {
             hi = detour_2gb_above(new);
@@ -154,4 +153,37 @@ pub fn detour_gen_jmp_immediate(pb_code: *mut u8, pb_jmp_val: *mut u8) {
             (pb_jmp_val as i32) - pb_jmp_src as i32,
         );
     }
+}
+
+#[inline]
+pub fn detour_does_code_end_function(inst: &Instruction) -> bool {
+    if inst.is_invalid() {
+        return true;
+    }
+
+    if inst.is_jmp_near()
+        || inst.is_jmp_near_indirect()
+        || inst.is_jmp_far_indirect()
+        || inst.is_jmp_far()
+        || inst.is_jmp_short_or_near()
+        || inst.is_jmp_short()
+    {
+        return true;
+    }
+
+    let code = inst.code();
+
+    if code == Code::Retnd
+        || code == Code::Retnw
+        || code == Code::Retnd_imm16
+        || code == Code::Retnw_imm16
+    {
+        return true;
+    }
+
+    if code == Code::Int3 {
+        return true;
+    }
+
+    false
 }
