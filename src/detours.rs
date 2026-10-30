@@ -310,28 +310,34 @@ impl Detour {
             }
         }
 
-        // 若因函数结束提前停止、覆盖字节数仍不足，尝试用 NOP / int3 padding 补齐。
+        // 若因函数结束提前停止、覆盖字节数仍不足，用 NOP / int3 padding 补齐。
         //
-        // 对齐 C++：padding **只扩大 patch 覆盖范围，不复制进 trampoline**。
-        // 这样写入 NEEDED_BYTES 字节的 jmp 不会踩到未备份的代码、detach 也能完整恢复。
+        // 对齐 C++ `detour_capture_target`：padding **只扩大 patch 覆盖范围，
+        // 不复制进 trampoline**。循环在 `fetch >= NEEDED_BYTES` 时结束，
+        // 允许一段 padding 跨过 NEEDED_BYTES（C++ 也是 `cbTarget += cFiller`
+        // 后不比较是否超出，只判断是否够）。
         //
-        // 探测只读 `NEEDED_BYTES - fetch` 字节（最多 4 字节）而不是固定
-        // `FILLER_MAX_PROBE`：目标代码末端可能紧贴页边界，读多了会跨进未映射页
-        // 触发访问违例。`is_code_filler` 对短切片同样正确（它按前缀匹配）。
+        // 探测长度不得超过「本内存区域剩余」：目标代码可能紧贴页边界，
+        // 多读会跨进未映射页触发访问违例。C++ 那边直接下标读 `pbCode[0..11]`，
+        // 这里比它更保守。
         while fetch < NEEDED_BYTES {
-            let remain = NEEDED_BYTES - fetch;
             let at = target.addr().wrapping_add(fetch);
-            // 只读「本区域剩余」与「还差多少字节」的较小值：
-            // 目标代码末端可能紧贴页边界，多读会跨进未映射页。
-            let cap = crate::platform::readable_len(at, remain.min(FILLER_MAX_PROBE));
+            let cap = crate::platform::readable_len(at, FILLER_MAX_PROBE);
             if cap == 0 {
                 break;
             }
             // SAFETY: `cap` 已由 `readable_len` 限定在当前内存区域之内。
             let probe = unsafe { std::slice::from_raw_parts(at as *const u8, cap) };
             let len = crate::inst::is_code_filler(probe);
-            if len == 0 || len > remain {
-                // 放不下整段 padding 就停下，交给下面统一判定失败。
+            if len == 0 {
+                break;
+            }
+            // 与 C++ 一致：不因 `len > remain` 而放弃；但整个覆盖范围必须
+            // 仍落在同一可读区域内，否则备份时会跨区访问。
+            if fetch + len > RESTORE_SIZE {
+                return Err(Error::NotEnoughMemory);
+            }
+            if crate::platform::readable_len(target.addr(), fetch + len) < fetch + len {
                 break;
             }
             fetch += len;
@@ -405,15 +411,27 @@ impl Detour {
         let target = self.target as *mut u8;
 
         #[cfg(target_arch = "x86_64")]
-        {
+        let jmp_end = {
             // 目标处跳到同块内的 thunk（保证 rel32 可达）。
             let code_in = self.block.as_ref().code_in.as_ptr() as *mut u8;
-            detour_gen_jmp_immediate(target, code_in);
-        }
+            detour_gen_jmp_immediate(target, code_in)
+        };
 
         #[cfg(not(target_arch = "x86_64"))]
-        {
-            detour_gen_jmp_immediate(target, self.detour_addr as *mut u8);
+        let jmp_end = detour_gen_jmp_immediate(target, self.detour_addr as *mut u8);
+
+        // 对齐 C++ `detour_gen_brk`：jmp 之后剩下的覆盖区域全部填 `int3`。
+        //
+        // 不填的话，残留的是原函数的**半条指令**——若线程恰好落在
+        // `jmp` 与 `target + fetch` 之间执行，会解释出随机指令而崩溃。
+        // 填 `0xcc` 至少能触发一个可预期的断点异常。
+        let limit = self.target + self.fetch;
+        let mut at = jmp_end as usize;
+        while at < limit {
+            // SAFETY: 该区间在 `MemoryProtector` 保护范围内，且 `at < limit`
+            // 保证不写越界。
+            unsafe { *(at as *mut u8) = 0xcc };
+            at += 1;
         }
 
         // 目标代码已改变，通知 CPU 丢弃旧的指令缓存。
@@ -1035,6 +1053,47 @@ mod tests {
     }
 
     // ── 指令边界映射表（EIP 修正的基础）──
+
+    #[test]
+    fn filler_may_overshoot_needed_bytes() {
+        // 对齐 C++：padding 消费不因「超出 NEEDED_BYTES」而放弃。
+        // 场景：还差 2 字节，但地址处是个 5 字节 NOP——C++ 会整体吃掉它，
+        // 使覆盖范围变成 8 字节。若这里改成 `len > remain` 就 break，
+        // 该函数会被误判为无法 hook。
+        let need = 5usize;
+        let fetch = 3usize; // remain = 2
+        let filler = 5usize; // 5 字节 NOP
+
+        let remain = need - fetch;
+        assert!(filler > remain, "此用例要求 padding 长于剩余字节");
+
+        // 采用 C++ 语义：接受并越过 NEEDED_BYTES
+        let new_fetch = fetch + filler;
+        assert!(new_fetch > need, "覆盖范围应越过 NEEDED_BYTES");
+        // 但必须仍在 restore 备份容量内
+        assert!(new_fetch <= RESTORE_SIZE, "越过 NEEDED_BYTES 后仍须可备份");
+    }
+
+    #[test]
+    fn install_fills_gap_with_int3() {
+        // 对齐 C++ `detour_gen_brk`：jmp 之后到 target+fetch 之间必须填 0xcc。
+        // 否则残留的是原函数的半条指令，线程落在此处会执行随机指令。
+        let mut buf = [0x90u8; 12]; // 模拟目标处原有的 NOP
+        let target = buf.as_mut_ptr();
+        let fetch = 8usize;
+
+        // 模拟写入 5 字节 jmp（此处只关心长度）
+        let jmp_len = 5usize;
+        let mut at = jmp_len;
+        while at < fetch {
+            unsafe { *target.add(at) = 0xcc };
+            at += 1;
+        }
+
+        assert_eq!(&buf[..5], &[0x90; 5], "jmp 区不应被覆盖");
+        assert_eq!(&buf[5..8], &[0xcc; 3], "jmp 之后到 fetch 之间应填 int3");
+        assert_eq!(buf[8], 0x90, "fetch 之后不应改动");
+    }
 
     #[test]
     fn align_table_records_and_looks_up() {

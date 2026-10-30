@@ -8,7 +8,7 @@ pub const NEEDED_BYTES: usize = AARCH64_JMP_SIZE;
 
 #[inline]
 #[cfg(target_os = "macos")]
-pub fn detour_gen_jmp_immediate(pb_code: *mut u8, pb_jmp_val: *mut u8) {
+pub fn detour_gen_jmp_immediate(pb_code: *mut u8, pb_jmp_val: *mut u8) -> *mut u8 {
     let delta =
         (pb_jmp_val.addr() as isize).saturating_sub(pb_code.addr().saturating_add(8) as isize);
     let mut buf = [0u32; 2];
@@ -19,6 +19,8 @@ pub fn detour_gen_jmp_immediate(pb_code: *mut u8, pb_jmp_val: *mut u8) {
     }
     // 失败说明目标页不可写，调用方无从补救（与 C++ 该路径一致：不检查返回值）。
     let _ = vcopy(pb_code.cast(), buf.as_ptr().cast(), 8);
+    // 与 x86/x64 保持同一签名：返回写入后的下一个字节地址。
+    pb_code.wrapping_byte_add(8)
 }
 
 #[inline]
