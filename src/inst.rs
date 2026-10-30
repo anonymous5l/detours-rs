@@ -443,16 +443,71 @@ impl Inst {
     }
 }
 
+/// 一条指令搬移后的形态：写入长度与需要回填的相对分支。
+///
+/// 由 [`plan_inst`] 先算出来，调用方据此检查 trampoline 容量，**确认放得下**
+/// 之后才调用 [`move_inst`] 真正写入——避免先写后查导致越界。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MovePlan {
+    /// 原指令字节数。
+    pub src_len: usize,
+    /// 将要写入的字节数。
+    pub dst_len: usize,
+    /// 待第二遍修正的相对分支。
+    pub branch: Option<BranchFixup>,
+}
+
+/// 计算搬移形态，不写任何内存。
+///
+/// 这是 [`move_inst`] 的纯计算部分，调用方必须在写入前用它的 `dst_len`
+/// 校验目标缓冲区容量。
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) fn plan_inst(inst: &Inst) -> Option<MovePlan> {
+    let src_len = inst.bytes().len();
+
+    if let Some(br) = inst.rel_branch() {
+        let (disp_off, dst_len) = if br.size == 1 {
+            // rel8 扩宽为 rel32：eb → e9（2→5），7x → 0f 8x（2→6）
+            match inst.bytes().get(br.prefix_len)? {
+                0xeb => (1, 5),
+                _ => (2, 6),
+            }
+        } else {
+            (br.offset, src_len)
+        };
+        return Some(MovePlan {
+            src_len,
+            dst_len,
+            branch: Some(BranchFixup {
+                disp_off,
+                dst_len,
+                target: br.target,
+            }),
+        });
+    }
+
+    Some(MovePlan {
+        src_len,
+        dst_len: src_len,
+        branch: None,
+    })
+}
+
 /// 把一条指令搬移到 trampoline 的 `dst`，并按需重定位。
 ///
 /// 对齐 C++ `CDetourDis::CopyInstruction` 的行为：
 /// - rel8 分支扩宽为 rel32（`eb` → `e9`，`7x` → `0f 8x`），保证搬移后仍可达；
 /// - RIP 相对寻址重算 disp32；
 /// - rel32 分支的位移在第二遍由 [`fix_branch`] 修正。
+///
+/// **调用方必须先通过 [`plan_inst`] 确认 `dst` 处至少有 `dst_len` 字节可写。**
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) fn move_inst(inst: &Inst, dst: *mut u8) -> Option<Moved> {
     let bytes = inst.bytes();
     let src_len = bytes.len();
+
+    // 形态判定统一走 plan_inst，确保与调用方的容量检查用同一套长度。
+    let plan = plan_inst(inst)?;
 
     // 1) 相对分支：按需扩宽编码。
     if let Some(br) = inst.rel_branch() {
@@ -532,6 +587,17 @@ pub(crate) fn move_inst(inst: &Inst, dst: *mut u8) -> Option<Moved> {
     })
 }
 
+/// 未支持重定位的架构：不做重定位，写入长度等于原指令长度。
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) fn plan_inst(inst: &Inst) -> Option<MovePlan> {
+    let len = inst.bytes().len();
+    Some(MovePlan {
+        src_len: len,
+        dst_len: len,
+        branch: None,
+    })
+}
+
 /// 未支持重定位的架构无相对分支需要回填。
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 pub(crate) fn fix_branch(_dst: *mut u8, _fixup: BranchFixup) {
@@ -566,11 +632,17 @@ impl Disassembler {
             return None;
         }
 
-        let insn = unsafe {
-            ptr::slice_from_raw_parts(ip as *const u8, ONE_INSTRUCTION_MAX_SIZE).as_ref()
+        // x86 单条指令最长 15 字节，故最多读 16 字节。但不能闭眼读满：
+        // 目标地址可能紧贴页边界，跨页读会触发访问违例。
+        // 先问出本地址所在内存区域的剩余长度，再据此切片。
+        let avail = crate::platform::readable_len(ip, ONE_INSTRUCTION_MAX_SIZE);
+        if avail == 0 {
+            return None;
         }
-        .and_then(|b| self.cap.disasm_count(b, self.ip as u64, 1).ok())
-        .and_then(|insts| insts.iter().next().map(OwnedInsn::from))?;
+
+        let insn = unsafe { ptr::slice_from_raw_parts(ip as *const u8, avail).as_ref() }
+            .and_then(|b| self.cap.disasm_count(b, self.ip as u64, 1).ok())
+            .and_then(|insts| insts.iter().next().map(OwnedInsn::from))?;
 
         // SAFETY: `OwnedInsn` 自持全部数据——`bytes` 是定长数组 `[u8; 24]`，
         // `detail` 由 `Box` 拥有并在其 `Drop` 中释放，生命周期参数只用于

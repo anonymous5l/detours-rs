@@ -47,8 +47,10 @@ impl MemoryProtector {
         if t_size > self.size {
             return 0;
         }
+        // 目标可能是任意用户地址，不保证按 `T` 对齐；`ptr::write` 要求对齐，
+        // 否则是未定义行为。改用 `write_unaligned`。
         unsafe {
-            ptr::write(self.addr as *mut T, value);
+            ptr::write_unaligned(self.addr as *mut T, value);
         }
         t_size
     }
@@ -107,6 +109,27 @@ pub fn detour_2gb_above(addr: usize) -> usize {
 pub const JMP_REL32_SIZE: usize = 5;
 /// `jmp qword ptr [rip+disp32]` 的编码长度。
 pub const JMP_RIP_INDIRECT_SIZE: usize = 6;
+
+/// 计算从 `addr` 起**可安全连续读取**的字节数，上限为 `want`。
+///
+/// 目标代码的末尾常常紧贴页边界，直接 `from_raw_parts(addr, 16)` 会跨进
+/// 未映射页触发访问违例。这里查出所在内存区域的剩余长度并据此截断；
+/// 查询失败时保守返回 0，让调用方放弃而不是冒险读。
+///
+/// 结果始终不超过 `want`，也不跨越区域边界。
+pub(crate) fn readable_len(addr: usize, want: usize) -> usize {
+    if addr == 0 || want == 0 {
+        return 0;
+    }
+    let Some(mbi) = crate::platform::vquery(addr as *const c_void) else {
+        return 0;
+    };
+
+    let base = mbi.base_address as usize;
+    let end = base.saturating_add(mbi.region_size);
+    let avail = end.saturating_sub(addr);
+    avail.min(want)
+}
 
 /// 编码 `jmp rel32`（`e9` + 相对位移）。
 ///
@@ -240,5 +263,24 @@ mod tests {
     fn copy_size_zero_capacity_writes_nothing() {
         assert_eq!(clamp_copy_size(0, 0), 0);
         assert_eq!(clamp_copy_size(10, 0), 0);
+    }
+
+    // ── readable_len：防止跨页读取 ──
+
+    #[test]
+    fn readable_len_rejects_null_and_zero() {
+        // 空指针与零长度请求都不能放行
+        assert_eq!(readable_len(0, 16), 0);
+        assert_eq!(readable_len(0x1000, 0), 0);
+    }
+
+    #[test]
+    fn readable_len_never_exceeds_request() {
+        // 无论区域多大，返回都不得超过调用方请求的长度
+        // （用栈上变量取得一个真实可查询的地址）
+        let buf = [0u8; 64];
+        let addr = buf.as_ptr() as usize;
+        assert!(readable_len(addr, 16) <= 16);
+        assert!(readable_len(addr, 1) <= 1);
     }
 }

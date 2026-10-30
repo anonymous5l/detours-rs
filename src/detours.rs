@@ -270,15 +270,23 @@ impl Detour {
                 return Err(Error::InvalidAddress);
             };
 
-            let dst = unsafe { rb_code.add(written) };
-            let Some(moved) = crate::inst::move_inst(&inst, dst) else {
+            // 先算形态、校验容量，**确认放得下再写**。
+            // 顺序很关键：若先写后查，越界的那几字节已经落到 `restore`
+            // 备份区里，之后的还原会写回被污染的数据。
+            let Some(plan) = crate::inst::plan_inst(&inst) else {
                 return Err(Error::InvalidAddress);
             };
 
             // 预留尾部 jmp（x64 为 6 字节间接跳）的空间。
-            if written + moved.dst_len + MAX_TAIL > PREFETCH_INST_SIZE {
+            if written + plan.dst_len + MAX_TAIL > PREFETCH_INST_SIZE {
                 return Err(Error::NotEnoughMemory);
             }
+
+            let dst = unsafe { rb_code.add(written) };
+            let Some(moved) = crate::inst::move_inst(&inst, dst) else {
+                return Err(Error::InvalidAddress);
+            };
+            debug_assert_eq!(moved.dst_len, plan.dst_len);
 
             if let Some(fixup) = moved.branch {
                 if nfix == MAX_FIXUPS {
@@ -305,12 +313,25 @@ impl Detour {
         // 若因函数结束提前停止、覆盖字节数仍不足，尝试用 NOP / int3 padding 补齐。
         //
         // 对齐 C++：padding **只扩大 patch 覆盖范围，不复制进 trampoline**。
-        // 这样写入 NEEDED_BYTES 字节的 jmp 不会踩到未备份的代码，detach 也能完整恢复。
+        // 这样写入 NEEDED_BYTES 字节的 jmp 不会踩到未备份的代码、detach 也能完整恢复。
+        //
+        // 探测只读 `NEEDED_BYTES - fetch` 字节（最多 4 字节）而不是固定
+        // `FILLER_MAX_PROBE`：目标代码末端可能紧贴页边界，读多了会跨进未映射页
+        // 触发访问违例。`is_code_filler` 对短切片同样正确（它按前缀匹配）。
         while fetch < NEEDED_BYTES {
-            let at = unsafe { target.cast::<u8>().add(fetch) };
-            let probe = unsafe { std::slice::from_raw_parts(at, FILLER_MAX_PROBE) };
+            let remain = NEEDED_BYTES - fetch;
+            let at = target.addr().wrapping_add(fetch);
+            // 只读「本区域剩余」与「还差多少字节」的较小值：
+            // 目标代码末端可能紧贴页边界，多读会跨进未映射页。
+            let cap = crate::platform::readable_len(at, remain.min(FILLER_MAX_PROBE));
+            if cap == 0 {
+                break;
+            }
+            // SAFETY: `cap` 已由 `readable_len` 限定在当前内存区域之内。
+            let probe = unsafe { std::slice::from_raw_parts(at as *const u8, cap) };
             let len = crate::inst::is_code_filler(probe);
-            if len == 0 {
+            if len == 0 || len > remain {
+                // 放不下整段 padding 就停下，交给下面统一判定失败。
                 break;
             }
             fetch += len;
@@ -323,6 +344,12 @@ impl Detour {
         // 关键：在改写目标代码前备份原始字节。
         // `code` 里存的是重定位后的指令（rel8 已扩宽为 rel32），
         // 只有这份备份能在 detach 时正确还原原函数。
+        //
+        // 先确认这 `fetch` 字节确实位于同一内存区域：`fetch` 可能因填充
+        // padding 而延伸到函数末尾之外，跨区域读取会访问违例。
+        if crate::platform::readable_len(target.addr(), fetch) < fetch {
+            return Err(Error::InvalidAddress);
+        }
         tramp
             .save_restore(target.cast::<u8>(), fetch)
             .ok_or(Error::NotEnoughMemory)?;
@@ -968,6 +995,43 @@ mod tests {
             RESTORE_SIZE >= worst,
             "RESTORE_SIZE({RESTORE_SIZE}) 必须覆盖最坏 fetch({worst})"
         );
+    }
+
+    #[test]
+    fn trampoline_layout_places_restore_right_after_code() {
+        // 回归防线：`code` 区一旦写越界，落点就是紧邻的 `restore` 备份，
+        // 之后 detach 会把被污染的数据写回目标函数。
+        // 这个断言把「先校验容量、再写入」的必要性固定在布局层面。
+        let t = zeroed_trampoline();
+        let base = &t as *const _ as usize;
+        let code = t.code_addr();
+        let restore_off = (&t.restore as *const _ as usize) - base;
+        let code_off = code - base;
+
+        assert_eq!(code_off, 0, "code 区应在结构体起始处");
+        assert_eq!(
+            restore_off,
+            code_off + PREFETCH_INST_SIZE,
+            "restore 紧邻 code 之后，code 越界必然污染备份"
+        );
+    }
+
+    #[test]
+    fn write_capacity_check_rejects_overflow() {
+        // 模拟 patch 循环的容量判定：任何时刻都必须留出尾部 jmp 的空间，
+        // 且 `written + dst_len` 不得越过 code 区。
+        for dst_len in [1usize, 2, 5, 6, 15] {
+            for written in 0..PREFETCH_INST_SIZE {
+                let overflow = written + dst_len + MAX_TAIL > PREFETCH_INST_SIZE;
+                let write_end = written + dst_len;
+                if !overflow {
+                    assert!(
+                        write_end <= PREFETCH_INST_SIZE,
+                        "未判定越界却写到 {write_end}，超出 code 容量"
+                    );
+                }
+            }
+        }
     }
 
     // ── 指令边界映射表（EIP 修正的基础）──

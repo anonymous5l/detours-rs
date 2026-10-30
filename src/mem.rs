@@ -357,5 +357,6 @@ pub fn raw_write<T: Sized>(addr: usize, data: T) -> usize {
 }
 
 pub fn raw_read<T: Sized>(ptr: usize) -> T {
-    unsafe { ptr::read::<T>(ptr as *const T) }
+    // 地址由调用方给出，不保证按 `T` 对齐；`ptr::read` 要求对齐，否则是 UB。
+    unsafe { ptr::read_unaligned(ptr as *const T) }
 }
